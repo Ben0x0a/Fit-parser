@@ -40,8 +40,6 @@ def setup_logging(results_root: Path, verbose: bool) -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # The log file always captures DEBUG level regardless of --verbose,
-    # so the full trace is available for forensic review after the run.
     file_handler = logging.FileHandler(results_root / "parse.log", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
@@ -220,6 +218,7 @@ def parse_csv(
 
 
 def main() -> None:
+    """Entry point: parse CLI arguments, discover FIT files, and process each one."""
     parser = argparse.ArgumentParser(
         description="Forensic parser for Garmin FIT files. Converts FIT files to enriched CSV with parsed timestamps."
     )

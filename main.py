@@ -46,8 +46,6 @@ def setup_logging(results_root: Path, verbose: bool) -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # The log file always captures DEBUG level regardless of --verbose,
-    # so the full trace is available for forensic review after the run.
     file_handler = logging.FileHandler(results_root / "parse.log", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
@@ -77,8 +75,6 @@ def load_sdk(sdk_path: Path):
 
     Raises ImportError with a descriptive message if the package cannot be found.
     """
-    # Insert at position 0 so this SDK takes priority over any other
-    # garmin_fit_sdk version that might already be installed in the environment.
     sys.path.insert(0, str(sdk_path.resolve()))
     try:
         from garmin_fit_sdk import Decoder, Stream
