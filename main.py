@@ -2,33 +2,21 @@ import argparse
 import hashlib
 import logging
 import math
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
-from csv import DictWriter, QUOTE_ALL
+from csv import DictReader, DictWriter, QUOTE_ALL
 
 # Seconds between the Unix epoch (1970-01-01) and the FIT epoch (1989-12-31).
 # Add this to any FIT timestamp to obtain a standard Unix timestamp.
 FIT_EPOCH_S = 631065600
 
-# The FIT specification reserves field number 253 for the timestamp in every
-# message type. Messages whose type is absent from the public profile are
-# decoded with numeric keys, so we must check this number as a fallback.
-_TIMESTAMP_FIELD_NUM = "253"
-
-# Columns added by this script, inserted before the SDK data columns.
-# The parsed_ prefix distinguishes them from Garmin SDK fields.
-PARSED_COLS = [
-    "parsed_source_filename",
-    "parsed_source_hash_sha256",
-    "parsed_message_type",
-    "parsed_timestamp_source",
-    "parsed_fit_timestamp",
-    "parsed_unix_timestamp",
-    "parsed_utc_timestamp",
-    "parsed_ref_fit_timestamp",
-    "parsed_ref_row",
-]
+# FitCSVTool.jar from the garmin/fit-sdk-tools git submodule (vendored at
+# fit-sdk-tools/), used as the default --jar path when the flag is given with
+# no value.
+DEFAULT_SDK_JAR = Path(__file__).resolve().parent / "fit-sdk-tools" / "FitCSVTool" / "FitCSVTool.jar"
 
 
 def setup_logging(results_root: Path, verbose: bool) -> logging.Logger:
@@ -66,24 +54,32 @@ def sha256_of_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def load_sdk(sdk_path: Path):
-    """Import and return (Decoder, Stream) from the Garmin FIT Python SDK.
+# ---------------------------------------------------------------------------
+# Python SDK backend (default) — decodes .fit files directly via garmin_fit_sdk.
+# ---------------------------------------------------------------------------
 
-    sdk_path must point to the directory that contains the garmin_fit_sdk
-    package (e.g. FitSDKRelease_*/py). It is inserted at the front of sys.path
-    so it takes priority over any other version already installed in the environment.
+# The FIT specification reserves field number 253 for the timestamp in every
+# message type. Messages whose type is absent from the public profile are
+# decoded with numeric keys, so we must check this number as a fallback.
+_TIMESTAMP_FIELD_NUM = "253"
 
-    Raises ImportError with a descriptive message if the package cannot be found.
-    """
-    sys.path.insert(0, str(sdk_path.resolve()))
-    try:
-        from garmin_fit_sdk import Decoder, Stream
-        return Decoder, Stream
-    except ImportError as e:
-        raise ImportError(f"Cannot import garmin_fit_sdk from '{sdk_path}': {e}") from e
+# Columns added by the Python backend, inserted before the SDK data columns.
+# The parsed_ prefix distinguishes them from Garmin SDK fields.
+PARSED_COLS_PY = [
+    "parsed_row_number",
+    "parsed_source_filename",
+    "parsed_source_hash_sha256",
+    "parsed_message_type",
+    "parsed_timestamp_source",
+    "parsed_fit_timestamp",
+    "parsed_unix_timestamp",
+    "parsed_utc_timestamp",
+    "parsed_ref_fit_timestamp",
+    "parsed_ref_row",
+]
 
 
-def decode_fit(fit_path: Path, Decoder, Stream, logger: logging.Logger):
+def decode_fit(fit_path: Path, logger: logging.Logger):
     """Decode a FIT file using the Garmin Python SDK.
 
     Returns (messages_dict, errors_list) on success, or (None, []) if the file
@@ -94,6 +90,8 @@ def decode_fit(fit_path: Path, Decoder, Stream, logger: logging.Logger):
     so that the full conversion chain can be recorded in the output CSV.
     Heart rate merging is disabled to preserve the original message structure.
     """
+    from garmin_fit_sdk import Decoder, Stream
+
     stream = Stream.from_file(str(fit_path))
     decoder = Decoder(stream)
 
@@ -125,12 +123,10 @@ def _resolve_timestamp(row: dict) -> tuple[int | None, str]:
     return None, ""
 
 
-def process_fit(
+def process_fit_py(
     fit_path: Path,
     output_path: Path,
     source_hash: str,
-    Decoder,
-    Stream,
     logger: logging.Logger,
 ) -> bool:
     """Decode a FIT file and write the enriched CSV to output_path.
@@ -140,7 +136,7 @@ def process_fit(
     Returns True on success, False if decoding or writing fails.
     """
     logger.info(f"  Decoding {fit_path}")
-    messages, errors = decode_fit(fit_path, Decoder, Stream, logger)
+    messages, errors = decode_fit(fit_path, logger)
     if messages is None:
         return False
 
@@ -162,7 +158,7 @@ def process_fit(
     for _, row in all_rows:
         data_fields.update(row.keys())
 
-    fieldnames = PARSED_COLS + sorted(data_fields)
+    fieldnames = PARSED_COLS_PY + sorted(data_fields)
 
     try:
         with open(output_path, "w", encoding="utf-8", newline="") as f:
@@ -178,6 +174,7 @@ def process_fit(
             # Row numbering starts at 2 to match spreadsheet convention
             # (row 1 is the header).
             for row_num, (mesg_type, row) in enumerate(all_rows, start=2):
+                row["parsed_row_number"] = row_num
                 row["parsed_source_filename"] = fit_path.name
                 row["parsed_source_hash_sha256"] = source_hash
                 row["parsed_message_type"] = mesg_type
@@ -251,21 +248,236 @@ def process_fit(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Java SDK backend (--jar) — converts via FitCSVTool.jar, then enriches the
+# raw SDK CSV. Preserved for pedagogical use: its raw output exposes the
+# Type / Field N / Value N structure of the FIT format.
+# ---------------------------------------------------------------------------
+
+# Columns added by the Java backend, inserted after the first two SDK columns
+# (Type, Local Number) for readability.
+PARSED_COLS_JAVA = [
+    "parsed_row_number",
+    "parsed_source_filename",
+    "parsed_source_hash_sha256",
+    "parsed_utc_timestamp",
+    "parsed_utc_timestamp_direct",
+    "parsed_ref_timestamp",
+    "parsed_ref_row",
+]
+
+
+def fit_ts_to_utc(timestamp: int) -> datetime:
+    """Convert a FIT timestamp (seconds since FIT epoch) to a UTC-aware datetime."""
+    return datetime.fromtimestamp((timestamp if timestamp else 0) + FIT_EPOCH_S, tz=timezone.utc)
+
+
+def convert_fit_to_csv(fit_path: Path, csv_path: Path, sdk_path: Path, logger: logging.Logger) -> bool:
+    """Convert a FIT file to raw CSV using FitCSVTool.jar.
+
+    Invokes the Garmin Java SDK via subprocess. Returns True on success,
+    False if the process returns a non-zero exit code or produces no output file.
+    """
+    logger.info(f"  SDK conversion: {fit_path} -> {csv_path}")
+    result = subprocess.run(
+        ["java", "-jar", str(sdk_path.resolve()), "-b", str(fit_path.resolve()), str(csv_path.resolve())],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "Invalid or corrupt jarfile" in stderr and sdk_path.stat().st_size < 1024:
+            logger.error(
+                f"  SDK conversion failed: {stderr} — '{sdk_path}' is a {sdk_path.stat().st_size}-byte "
+                "Git LFS pointer file, not the real jar. Run 'git lfs pull' inside the fit-sdk-tools/ "
+                "submodule (git-lfs must be installed: https://git-lfs.com/) and try again."
+            )
+        else:
+            logger.error(f"  SDK conversion failed: {stderr}")
+        return False
+    if not csv_path.exists():
+        logger.error("  SDK conversion produced no output file")
+        return False
+    return True
+
+
+def parse_csv_java(
+    csv_path: Path,
+    output_path: Path,
+    source_fit: Path,
+    source_hash: str,
+    logger: logging.Logger,
+) -> bool:
+    """Enrich the raw SDK CSV with parsed_ provenance and timestamp columns.
+
+    Reads the intermediate CSV produced by FitCSVTool.jar and writes an
+    enriched version to output_path. Handles all three FIT timestamp mechanisms:
+    absolute timestamp, 16-bit relative timestamp_16, and stress_level_time.
+    Returns True on success, False on any read/write error.
+    """
+    logger.info(f"  Parsing {csv_path} -> {output_path}")
+
+    try:
+        with open(csv_path, "r", encoding="utf-8") as input_file, \
+             open(output_path, "w", encoding="utf-8", newline="") as output_file:
+
+            reader = DictReader(input_file)
+            fieldnames = list(reader.fieldnames)
+
+            # Insert parsed_ columns right after the first two SDK columns
+            # (Type and Local Number) so they appear near the left of the CSV.
+            for i, col in enumerate(PARSED_COLS_JAVA):
+                fieldnames.insert(2 + i, col)
+
+            writer = DictWriter(output_file, quoting=QUOTE_ALL, fieldnames=fieldnames)
+            writer.writeheader()
+
+            # Count how many Field N / Value N column pairs the SDK produced.
+            # The SDK uses a variable number depending on the widest message.
+            max_field_number = 0
+            while f"Field {max_field_number + 1}" in reader.fieldnames:
+                max_field_number += 1
+
+            base_timestamp: int = 0
+            base_timestamp_row: int | None = None
+
+            # Row numbering starts at 2 to match spreadsheet convention
+            # (row 1 is the header).
+            for row_num, row in enumerate(reader, start=2):
+                row["parsed_row_number"] = row_num
+                row["parsed_source_filename"] = source_fit.name
+                row["parsed_source_hash_sha256"] = source_hash
+                row["parsed_utc_timestamp"] = ""
+                row["parsed_utc_timestamp_direct"] = ""
+                row["parsed_ref_timestamp"] = ""
+                row["parsed_ref_row"] = ""
+
+                if row.get("﻿Type") == "Data":
+                    # The SDK CSV starts with a UTF-8 BOM (﻿), which Python's
+                    # csv module attaches to the first column name rather than
+                    # stripping it, hence the "﻿Type" key instead of "Type".
+                    for i in range(1, max_field_number + 1):
+                        field = row.get(f"Field {i}", "")
+                        value = row.get(f"Value {i}", "")
+
+                        if not field or not value:
+                            continue
+
+                        is_stress = row["Message"] == "stress_level" and field == "stress_level_time"
+                        is_ts = field == "timestamp"
+                        is_ts16 = field == "timestamp_16"
+
+                        # Only timestamp-related fields need integer conversion;
+                        # skipping other fields avoids spurious warnings for
+                        # legitimate float values like enhanced_altitude or distance.
+                        if not (is_stress or is_ts or is_ts16):
+                            continue
+
+                        try:
+                            int_value = int(value)
+                        except ValueError:
+                            logger.warning(
+                                f"  {source_fit.name} row {row_num}: non-integer value '{value}' "
+                                f"for field '{field}' — skipping field"
+                            )
+                            continue
+
+                        if is_stress:
+                            # stress_level messages use a dedicated absolute timestamp
+                            # field instead of the standard timestamp field.
+                            row["parsed_utc_timestamp"] = fit_ts_to_utc(int_value)
+                            row["parsed_utc_timestamp_direct"] = datetime.fromtimestamp(
+                                int_value + FIT_EPOCH_S, tz=timezone.utc
+                            )
+                            row["parsed_ref_timestamp"] = int_value
+                            row["parsed_ref_row"] = row_num
+
+                        elif is_ts:
+                            # Absolute timestamp — update the reference used by subsequent timestamp_16 rows.
+                            base_timestamp = int_value
+                            base_timestamp_row = row_num
+                            logger.debug(
+                                f"  {source_fit.name}: base_timestamp -> {base_timestamp} "
+                                f"({fit_ts_to_utc(base_timestamp)}) at row {row_num}"
+                            )
+                            row["parsed_utc_timestamp"] = fit_ts_to_utc(base_timestamp)
+                            row["parsed_utc_timestamp_direct"] = datetime.fromtimestamp(
+                                base_timestamp + FIT_EPOCH_S, tz=timezone.utc
+                            )
+                            row["parsed_ref_timestamp"] = base_timestamp
+                            row["parsed_ref_row"] = row_num
+
+                        elif is_ts16:
+                            if not base_timestamp:
+                                logger.warning(
+                                    f"  {source_fit.name} row {row_num}: timestamp_16 with no base_timestamp set — skipping"
+                                )
+                            else:
+                                # Rollover-safe 16-bit offset from base_timestamp.
+                                # The masking ensures correct handling when the low 16 bits of
+                                # base_timestamp wrap past 0xFFFF between two consecutive records.
+                                adjusted = base_timestamp + ((int_value - (base_timestamp & 0xFFFF)) & 0xFFFF)
+                                row["parsed_utc_timestamp"] = fit_ts_to_utc(adjusted)
+                                row["parsed_utc_timestamp_direct"] = datetime.fromtimestamp(
+                                    adjusted + FIT_EPOCH_S, tz=timezone.utc
+                                )
+                                row["parsed_ref_timestamp"] = base_timestamp
+                                row["parsed_ref_row"] = base_timestamp_row
+
+                writer.writerow(row)
+
+        return True
+
+    except Exception as e:
+        logger.error(f"  Failed to parse {csv_path}: {e}")
+        return False
+
+
+def process_fit_java(
+    fit_path: Path,
+    output_path: Path,
+    source_hash: str,
+    sdk_jar: Path,
+    logger: logging.Logger,
+) -> tuple[bool, bool]:
+    """Convert and enrich a FIT file via FitCSVTool.jar. Returns (converted, parsed)."""
+    # TemporaryDirectory is used for the intermediate SDK CSV so it is
+    # deleted automatically on exit, even if an exception occurs.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        csv_path = Path(tmp_dir) / fit_path.with_suffix(".csv").name
+
+        if not convert_fit_to_csv(fit_path, csv_path, sdk_jar, logger):
+            return False, False
+
+        return True, parse_csv_java(csv_path, output_path, fit_path, source_hash, logger)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     """Entry point: parse CLI arguments, discover FIT files, and process each one."""
     parser = argparse.ArgumentParser(
         description=(
-            "Forensic parser for Garmin FIT files using the Python SDK. "
-            "Decodes FIT files to enriched CSV with full timestamp traceability. No Java required."
+            "Forensic parser for Garmin FIT files. Decodes FIT files to enriched CSV with "
+            "full timestamp traceability. Uses the Python SDK by default (no Java required); "
+            "pass --jar to use the Java FitCSVTool backend instead."
         )
     )
     parser.add_argument("input", type=Path, help="Root folder containing .fit files to process")
     parser.add_argument("output", type=Path, help="Root folder for results (mirrors input tree)")
     parser.add_argument(
-        "--sdk",
+        "--jar",
+        nargs="?",
         type=Path,
-        required=True,
-        help="Path to the garmin_fit_sdk package directory (e.g. FitSDKRelease_21_105_00/py)",
+        const=DEFAULT_SDK_JAR,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Use the Java FitCSVTool backend instead of the default Python SDK. "
+            f"Optionally give a path to FitCSVTool.jar (default if omitted: {DEFAULT_SDK_JAR})."
+        ),
     )
     parser.add_argument("--verbose", action="store_true", help="Print DEBUG-level messages to console")
     args = parser.parse_args()
@@ -273,18 +485,16 @@ def main() -> None:
     if not args.input.is_dir():
         print(f"Error: input folder '{args.input}' does not exist.", file=sys.stderr)
         sys.exit(1)
-
-    try:
-        Decoder, Stream = load_sdk(args.sdk)
-    except ImportError as e:
-        print(f"Error: {e}", file=sys.stderr)
+    if args.jar is not None and not args.jar.is_file():
+        print(f"Error: SDK jar '{args.jar}' not found.", file=sys.stderr)
         sys.exit(1)
 
     args.output.mkdir(parents=True, exist_ok=True)
     logger = setup_logging(args.output, args.verbose)
+    backend_note = f", backend: java, sdk: {args.jar.resolve()}" if args.jar is not None else ", backend: python"
     logger.info(
         f"FIT Parser started — input: {args.input.resolve()}, "
-        f"output: {args.output.resolve()}, sdk: {args.sdk.resolve()}"
+        f"output: {args.output.resolve()}{backend_note}"
     )
 
     fit_files = sorted(p for p in args.input.rglob("*") if p.is_file() and p.suffix.lower() == ".fit")
@@ -302,6 +512,7 @@ def main() -> None:
         result_dir = args.output / fit_path.relative_to(args.input).parent
         result_dir.mkdir(parents=True, exist_ok=True)
 
+    converted_ok = 0
     parsed_ok = 0
 
     for idx, fit_path in enumerate(fit_files, start=1):
@@ -313,13 +524,24 @@ def main() -> None:
         source_hash = sha256_of_file(fit_path)
         logger.info(f"  SHA256: {source_hash}")
 
-        if process_fit(fit_path, parsed_path, source_hash, Decoder, Stream, logger):
-            parsed_ok += 1
+        if args.jar is not None:
+            converted, success = process_fit_java(fit_path, parsed_path, source_hash, args.jar, logger)
+            converted_ok += int(converted)
+        else:
+            success = process_fit_py(fit_path, parsed_path, source_hash, logger)
+
+        parsed_ok += int(success)
 
     failed = total - parsed_ok
-    logger.info(
-        f"FIT Parser finished — {total} found, {parsed_ok} parsed successfully, {failed} failed"
-    )
+    if args.jar is not None:
+        logger.info(
+            f"FIT Parser finished — {total} found, {converted_ok} converted, "
+            f"{parsed_ok} parsed successfully, {failed} failed"
+        )
+    else:
+        logger.info(
+            f"FIT Parser finished — {total} found, {parsed_ok} parsed successfully, {failed} failed"
+        )
     if failed:
         sys.exit(1)
 
